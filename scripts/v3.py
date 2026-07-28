@@ -3,21 +3,36 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-BLOCK_SIZE = 8
-BATCH_SIZE = 4
-EPOCHS = 20000
+BLOCK_SIZE = 256
+BATCH_SIZE = 64
+EPOCHS = 2500
 EVAL_INTERVAL = 300
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 3e-4
 VOCAB_SIZE = 65
 EVAL_ITERS = 200
-N_EMBD = 32
-HEAD = 16
+
+N_EMBD = 384
+N_HEADS = 6
+# ATTENTION_SIZE = 16
+HEAD_SIZE = N_EMBD // N_HEADS
+N_LAYERS = 6
+
+DROPOUT_RATE = 0.2
+
 # ---------------
+
+# the fact that we are using the triangular mask of the lower-triangular matrix is 
+# the indication that we have a decoder-only network, no encoder. 
 
 torch.manual_seed(1337)
 
+
 with open("data/input.txt", "r") as file: 
     text = file.read()
+
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
+
+print(device)
 
 # all the unique characters that occur in this text
 chars = sorted(list(set(text)))
@@ -33,12 +48,12 @@ train = data[:int(0.9 * len(data))]
 test = data[int(0.9 * len(data)):]
 
 # create batches for specific splits
-def get_batch(split): 
+def get_batch(split, batch_size=BATCH_SIZE): 
     data = train if split == "train" else test
-    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    ix = torch.randint(len(data) - BLOCK_SIZE, (batch_size,))
     x = torch.stack([data[i: i + BLOCK_SIZE] for i in ix])
     y = torch.stack([data[i + 1: i + BLOCK_SIZE + 1] for i in ix])
-    return x, y
+    return x.to(device), y.to(device)
 
 @torch.no_grad()
 def evaluate_loss(model): 
@@ -46,11 +61,11 @@ def evaluate_loss(model):
     out = {}
     model.eval()
     for split in ["train", "val"]:
-        losses = torch.zeros(EVAL_ITERS)
+        losses = torch.zeros(EVAL_ITERS).to(device=device)
         for k in range(EVAL_ITERS):
             xb, yb = get_batch(split)
             _, loss = model(xb, yb)
-            losses[k] = loss
+            losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
@@ -59,15 +74,16 @@ def evaluate_loss(model):
 # NOTE: LM-Head is the head that turns embedding size vector into actual vocab size vector, a SA-head is the head the performs
 # self-attention
 
-class Head(nn.Module):
-    def __init__(self, h_embd=HEAD):
+class AttentionHead(nn.Module):
+    def __init__(self, head_size):
         super().__init__()
 
-        self.head_size = h_embd
-        self.key = nn.Linear(N_EMBD, h_embd, bias=False)
-        self.query = nn.Linear(N_EMBD, h_embd, bias=False)
-        self.value = nn.Linear(N_EMBD, h_embd)
-        self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE,BLOCK_SIZE,dtype=torch.int)))
+        self.head_size = head_size
+        self.key = nn.Linear(N_EMBD, self.head_size, bias=False)
+        self.query = nn.Linear(N_EMBD, self.head_size, bias=False)
+        self.value = nn.Linear(N_EMBD, self.head_size)
+        self.dropout = nn.Dropout(DROPOUT_RATE)
+        self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE,BLOCK_SIZE,dtype=torch.int)).to(device=device))
     
     def forward(self, x):
         _,T,_ = x.shape
@@ -77,57 +93,79 @@ class Head(nn.Module):
         
         wei = torch.masked_fill(wei, (self.tril[:T, :T] == 0), float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         
         v = self.value(x)
         out = wei @ v
         
-        return out
-    
-# create a Multi-Head Attention module
-# essentially it uses a module list and then takes two parameters: n_heads and h_embd. 
-# and then it returns a concatenated version of all heads in the `forward` pass
-
+        return out # (B, T, 4)
+        
 class FFN(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
-            nn.ReLU()
+            nn.Linear(n_embd, 4 * n_embd), # (B, T, 32 * 4)
+            nn.GELU(),
+            nn.Linear(4 * n_embd, n_embd), # this is another projection; this time for the FFN, but for specifically upsampling to get a more rich representation
+            nn.Dropout(DROPOUT_RATE)
         )
     
-    def forward(self, x):
+    def forward(self, x): 
         return self.net(x)
 
+# create a Multi-Head Attention module
+# essentially it uses a module list and then takes two parameters: n_heads and n_embd. 
+# and then it returns a concatenated version of all heads in the `forward` pass
+
 class MultiHead(nn.Module):
-    def __init__(self, n_heads, h_embd):
+    def __init__(self, n_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList(Head(h_embd) for _ in range(n_heads))
+        self.heads = nn.ModuleList(AttentionHead(head_size) for _ in range(n_heads)) # (B, T, 32)
+        self.proj = nn.Linear(head_size * n_heads, N_EMBD) # (B, T, 32)
+        self.dropout = nn.Dropout(DROPOUT_RATE)
+        
+        # a projection has NOTHING to do with residuals; all it does it provide some kind of linear transformation
+        # for instance, if you want to downsample because you just expanded to large dimension, and then bringing it back down to lower dimension for processing purposes
+        # or, in this case, using it to mix together embeddings with same-dimension mapping
     
     def forward(self, x):
         x = torch.cat([head(x) for head in self.heads], dim=-1)
-        return x
+        return self.dropout(self.proj(x))
 
 # create a `Block` class that performs communication then computation (attention --> FFN)
 class Block(nn.Module):
-    pass
-class BigramLanguageModel(nn.Module):
+    def __init__(self, n_heads, head_size, embd_size):
+        super().__init__()
+        self.attention = MultiHead(n_heads, head_size)
+        self.ffn = FFN(embd_size) # (B, T, 32)
+        self.ln1 = nn.LayerNorm(embd_size) # for self.attention
+        self.ln2 = nn.LayerNorm(embd_size) # for ffn
+    
+    def forward(self, x):
+        x = self.attention(self.ln1(x)) + x # we add `x` back to mark a residual connection; essentially, we are mixing the old information with the new  
+        x = self.ffn(self.ln2(x)) + x # same here 
+        return x # (B, T, 32)
+
+class TransformerLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.table_embedding = nn.Embedding(VOCAB_SIZE, N_EMBD) # we represent each token in each batch with just 32 values
         self.positional_embedding = nn.Embedding(BLOCK_SIZE, N_EMBD)
-        self.sa_heads = MultiHead(4, N_EMBD//4)
-        self.ffn = FFN(N_EMBD)
+        self.blocks = nn.Sequential(
+            *[Block(n_heads=N_HEADS, head_size=HEAD_SIZE, embd_size=N_EMBD) for _ in range(N_LAYERS)]
+        )
+        self.ln = nn.LayerNorm(N_EMBD)
         self.lm_head = nn.Linear(N_EMBD, VOCAB_SIZE)
     
     def forward(self, index, targets=None) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T = index.shape
         tok_emb = self.table_embedding(index) # (B, T, C), C = N_EMBD
-        pos_emb = self.positional_embedding(torch.arange(end=T)) # (T, C), C = N_EMBD -> Broadcast operation applied!
+        pos_emb = self.positional_embedding(torch.arange(end=T, device=index.device)) # (T, C), C = N_EMBD -> Broadcast operation applied!
         
         emb = tok_emb + pos_emb # (B, T, C)
-        emb = self.sa_heads(emb)
-        emb = self.ffn(emb)
-        logits = self.lm_head(emb) # (B, T, VOCAB_SIZE)
+        emb = self.blocks(emb)
+        logits = self.lm_head(emb) # (B, T, VOCAB_SIZE) --> this is the new vector. `lm_head` is a layer that produces a 65-sized vector that shows 
+        # probabilities for what will be the next token. then, we just take the representation
         
         if targets is None:
             loss = None
@@ -147,7 +185,6 @@ class BigramLanguageModel(nn.Module):
             logits = logits[:, -1, :] # this will take just the last timestep for all batches with all vocab size --> (B, C)
             # convert into probabilities from embeddings; we don't want raw logits, we want the converted probabilities or likelihood of what is the next character
             probs = F.softmax(logits, dim=-1) # still (B, C)
-            # then sample the next token
             next_idx = torch.multinomial(probs, 1) # then this becomes just (B, 1)
             index = torch.cat((index, next_idx), dim=1)
         return index
@@ -156,8 +193,9 @@ class BigramLanguageModel(nn.Module):
         for i in range(EPOCHS):
             if i % EVAL_INTERVAL == 0:
                 out = evaluate_loss(self)
-                print(f"Epoch {i}: train loss (%.4f) {out["train"]:.4f}, val loss (%.4f) {out["val"]:.4f}")
+                print(f'Epoch {i}: train loss (%.4f) {out["train"]:.4f}, val loss (%.4f) {out["val"]:.4f}')
             xb, yb = get_batch("train")
+
             _, loss = self(xb, yb)
             
             optimizer.zero_grad()
@@ -165,12 +203,13 @@ class BigramLanguageModel(nn.Module):
             loss.backward()
             optimizer.step()
 
-m = BigramLanguageModel()
-optimizer = torch.optim.AdamW(params=m.parameters(), lr=0.001)
+m = TransformerLanguageModel().to(device=device)
+optimizer = torch.optim.AdamW(params=m.parameters(), lr=LEARNING_RATE)
 m.run_train(optimizer)
 
-idxs = m.generate(torch.zeros((4,1), dtype=torch.int), 100)
+idxs = m.generate(get_batch("test", 1)[0], 250)
 
+print(idxs)
 for idx in idxs:
     print(decode(idx.tolist()))
 
