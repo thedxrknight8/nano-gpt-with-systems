@@ -77,20 +77,22 @@ def evaluate_loss(model):
 # self-attention
 
 class AttentionHead(nn.Module):
-    def __init__(self, head_size, num_head, kv_cache=None, use_cache=False):
+    def __init__(self, head_size, num_head):
         super().__init__()
 
         self.head_size = head_size
+        self.num_head = num_head
+            
         self.key = nn.Linear(N_EMBD, self.head_size, bias=False)
         self.query = nn.Linear(N_EMBD, self.head_size, bias=False)
         self.value = nn.Linear(N_EMBD, self.head_size)
         self.dropout = nn.Dropout(DROPOUT_RATE)
         self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE,BLOCK_SIZE,dtype=torch.int)).to(device=device))
     
-    def forward(self, x, ):
-        _,T,_ = x.shape
-        k = self.key(x)
+    def forward(self, x, kv_cache=torch.Tensor | None, use_cache=False):
+        B,T,_ = x.shape
         q = self.query(x)
+        
         wei = q @ torch.transpose(k, -2, -1) * self.head_size ** -0.5
         
         wei = torch.masked_fill(wei, (self.tril[:T, :T] == 0), float('-inf'))
@@ -99,6 +101,9 @@ class AttentionHead(nn.Module):
         
         v = self.value(x)
         out = wei @ v
+        
+        if use_cache:
+            kv_cache[]
         
         return out # (B, T, 4)
         
@@ -120,9 +125,9 @@ class FFN(nn.Module):
 # and then it returns a concatenated version of all heads in the `forward` pass
 
 class MultiHead(nn.Module):
-    def __init__(self, n_heads, head_size, kv_cache=None, use_cache=False):
+    def __init__(self, n_heads, head_size, kv_cache, use_cache):
         super().__init__()
-        self.heads = nn.ModuleList(AttentionHead(head_size, idx, ) for idx in range(n_heads)) # (B, T, 32)
+        self.heads = nn.ModuleList(AttentionHead(head_size, idx, kv_cache, use_cache) for idx in range(n_heads)) # (B, T, 32)
         self.proj = nn.Linear(head_size * n_heads, N_EMBD) # (B, T, 32)
         self.dropout = nn.Dropout(DROPOUT_RATE)
         
@@ -130,8 +135,11 @@ class MultiHead(nn.Module):
         # for instance, if you want to downsample because you just expanded to large dimension, and then bringing it back down to lower dimension for processing purposes
         # or, in this case, using it to mix together embeddings with same-dimension mapping
     
-    def forward(self, x):
-        x = torch.cat([head(x) for head in self.heads], dim=-1)
+    def forward(self, x, kv_cache=None, use_cache=False):
+        if use_cache:
+            x = torch.cat([head(x, kv_cache, use_cache) for head in self.heads], dim=-1)
+        else:
+            x = torch.cat([head(x) for head in self.heads], dim=-1)
         return self.dropout(self.proj(x))
 
 # create a `Block` class that performs communication then computation (attention --> FFN)
@@ -143,8 +151,12 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(embd_size) # for self.attention
         self.ln2 = nn.LayerNorm(embd_size) # for ffn
     
-    def forward(self, x):
-        x = self.attention(self.ln1(x)) + x # we add `x` back to mark a residual connection; essentially, we are mixing the old information with the new  
+    def forward(self, x: torch.Tensor, use_cache=False):
+        kv_cache = None
+        if use_cache:
+            B,T,_= x.shape
+            kv_cache = torch.zeros(B, N_HEADS, T, HEAD_SIZE)
+        x = self.attention(self.ln1(x), kv_cache, use_cache) + x # we add `x` back to mark a residual connection; essentially, we are mixing the old information with the new  
         x = self.ffn(self.ln2(x)) + x # same here 
         return x # (B, T, 32)
 
@@ -160,18 +172,19 @@ class TransformerLanguageModel(nn.Module):
         self.ln = nn.LayerNorm(N_EMBD)
         self.lm_head = nn.Linear(N_EMBD, VOCAB_SIZE)
         
+        
         self.tbt_total = 0.0
         self.ttft = 0.0
         self.tbt = 0.0
     
-    def forward(self, index, targets=None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(self, index, targets=None, use_cache=False) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T = index.shape
         tok_emb = self.table_embedding(index) # (B, T, C), C = N_EMBD
         pos_emb = self.positional_embedding(torch.arange(end=T, device=index.device)) # (T, C), C = N_EMBD -> Broadcast operation applied!
         
         emb = tok_emb + pos_emb # (B, T, C)
-        emb = self.blocks(emb)
-        logits = self.lm_head(emb) # (B, T, VOCAB_SIZE) --> this is the new vector. `lm_head` is a layer that produces a 65-sized vector that shows 
+        emb = self.blocks(emb, use_cache)
+        logits = self.lm_head(self.ln(emb)) # (B, T, VOCAB_SIZE) --> this is the new vector. `lm_head` is a layer that produces a 65-sized vector that shows 
         # probabilities for what will be the next token. then, we just take the representation
         
         if targets is None:
@@ -238,6 +251,7 @@ for idx in idxs:
     print(decode(idx.tolist()))
 
 with open("/outputs/metrics.txt", "w") as f:
+    f.write(f"params={sum(p.numel() for p in m.parameters())}")
     f.write(f"average_tbt={m.tbt} max_tokens_generated={MAX_TOKENS_GENERATE}\n")
     f.write(f"ttft={m.ttft} max_tokens_generated={MAX_TOKENS_GENERATE}")
     f.write("-----------------------")
