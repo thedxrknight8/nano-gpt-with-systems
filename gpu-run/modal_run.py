@@ -14,7 +14,7 @@ image = (
 def train():
     import subprocess
     subprocess.run(
-        ["python", "-u", "scripts/v3.py"],
+        ["python", "-u", "scripts/v5.py"],
         cwd="/root/nano-gpt",
         check=True,
     )
