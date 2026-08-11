@@ -219,8 +219,7 @@ class TransformerLanguageModel(nn.Module):
         self.ttft = 0.0
         self.tbt = 0.0
     
-    def forward(self, index, targets=None, kv_cache=None, use_cache=False, mask_use=True) -> tuple[
-        Any, Tensor | None, list[Tensor] | None | Any]:
+    def forward(self, index, targets=None, kv_cache=None, use_cache=False, mask_use=True):
         B, T = index.shape
         past_length = 0
 

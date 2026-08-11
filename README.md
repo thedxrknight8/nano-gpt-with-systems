@@ -28,9 +28,9 @@ latency measurement.
 
 | File                | Stage                    | Main additions                                                                                                                |
 | ------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `scripts/bigram.py` | Bigram baseline          | Token-to-next-token lookup table and cross-entropy training                                                                   |
-| `scripts/v2.py`     | First attention model    | Token positions, causal self-attention, multiple heads, and a feed-forward layer                                              |
-| `scripts/v3.py`     | Decoder-only transformer | Six transformer blocks, residual connections, layer normalization, dropout, device placement, generation, and latency metrics |
+| `scripts/init_models/bigram.py` | Bigram baseline          | Token-to-next-token lookup table and cross-entropy training                                                                   |
+| `scripts/init_models/v2.py`     | First attention model    | Token positions, causal self-attention, multiple heads, and a feed-forward layer                                              |
+| `scripts/init_models/v3.py`     | Decoder-only transformer | Six transformer blocks, residual connections, layer normalization, dropout, device placement, generation, and latency metrics |
 
 `v3.py` is the current documented baseline.
 
@@ -86,7 +86,7 @@ character using cross-entropy loss.
 | Training steps     |      2,500 |
 | Generated tokens   |        250 |
 
-All hyperparameters are defined near the top of `scripts/v3.py`.
+All hyperparameters are defined near the top of `scripts/init_models/v3.py`.
 
 ## Repository Layout
 
