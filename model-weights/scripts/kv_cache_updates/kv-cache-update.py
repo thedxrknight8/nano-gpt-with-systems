@@ -80,6 +80,36 @@ def evaluate_loss(model):
 # NOTE: LM-Head is the head that turns embedding size vector into actual vocab size vector, a SA-head is the head the performs
 # self-attention
 
+class RoPEModule(nn.Module):
+    def __init__(self, d_head, max_seq_length=MAX_TOKENS_GENERATE, base=10000):
+        super().__init__()
+
+        theta = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head)) # (d_head // 2,)
+
+        seq_length = torch.arange(max_seq_length).float() # (max_seq_length,)
+        theta_values = torch.outer(seq_length, theta) # (max_seq_length,d_head//2) -> gives you the rotation values  
+
+        self.register_buffer("sin", torch.sin(theta_values))
+        self.register_buffer("cos", torch.cos(theta_values))
+
+    def forward(self, x, start_pos):
+        T = x.shape[1]
+
+        x_evens = x[..., 0::2]
+        x_odds = x[..., 1::2]
+
+        cos = self.cos[start_pos: start_pos + T, :].unsqueeze(0)
+        sin = self.sin[start_pos:, :].unsqueeze(0)
+
+        x_first = x_evens * cos - x_odds * sin
+        x_second = x_evens * sin + x_odds * cos
+
+        out = torch.empty_like(x)
+        out[..., 0::2] = x_first
+        out[..., 1::2] = x_second
+
+        return out 
+
 class AttentionHead(nn.Module):
     def __init__(self, head_size):
         super().__init__()
@@ -88,6 +118,7 @@ class AttentionHead(nn.Module):
         self.key = nn.Linear(N_EMBD, self.head_size, bias=False)
         self.query = nn.Linear(N_EMBD, self.head_size, bias=False)
         self.value = nn.Linear(N_EMBD, self.head_size)
+        self.rope = RoPEModule(N_EMBD, MAX_TOKENS_GENERATE)
         self.dropout = nn.Dropout(DROPOUT_RATE)
         self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE,BLOCK_SIZE,dtype=torch.int)).to(device=DEVICE))
     
@@ -98,6 +129,9 @@ class AttentionHead(nn.Module):
         k = self.key(x)
         q = self.query(x)
         v = self.value(x)
+
+        k = self.rope(k)
+        q = self.rope(q)
         
         k_attention = k
         v_attention = v
@@ -199,7 +233,6 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(self.embd_size) # for ffn
     
     def forward(self, x, kv_cache, use_cache, mask_use=True):
-        B,T,_ = x.shape
         out, kv_cache = self.attention(self.ln1(x), kv_cache, use_cache, mask_use)
         x = out + x # we add `x` back to mark a residual connection; essentially, we are mixing the old information with the new
         x = self.ffn(self.ln2(x)) + x # same here 
@@ -210,7 +243,6 @@ class TransformerLanguageModel(nn.Module):
         super().__init__()
         
         self.table_embedding = nn.Embedding(VOCAB_SIZE, N_EMBD) # we represent each token in each batch with just 32 values
-        self.positional_embedding = nn.Embedding(BLOCK_SIZE, N_EMBD)
         self.blocks = nn.ModuleList([Block(N_HEADS, HEAD_SIZE, N_EMBD) for _ in range(N_LAYERS)])
         self.ln = nn.LayerNorm(N_EMBD)
         self.lm_head = nn.Linear(N_EMBD, VOCAB_SIZE)
@@ -221,20 +253,14 @@ class TransformerLanguageModel(nn.Module):
     
     def forward(self, index, targets=None, kv_cache=None, use_cache=False, mask_use=True):
         B, T = index.shape
-        past_length = 0
 
         tok_emb = self.table_embedding(index) # (B, T, C), C = N_EMBD
         if use_cache and kv_cache is None:
             kv_cache = [None] * 2
             kv_cache[0] = torch.empty(size=(B, N_LAYERS, N_HEADS, 0, HEAD_SIZE), device=DEVICE)
             kv_cache[1] = torch.empty(size=(B, N_LAYERS, N_HEADS, 0, HEAD_SIZE), device=DEVICE)
-        if use_cache and kv_cache is not None:
-            past_length = kv_cache[0].shape[3]
 
-        positions = torch.arange(past_length, past_length + T, device=index.device)
-        pos_emb = self.positional_embedding(positions) # (T, C), C = N_EMBD -> Broadcast operation applied!
-
-        emb = tok_emb + pos_emb # (B, T, C)
+        emb = tok_emb # (B, T, C)
 
         updated_kv_cache = []
         for i, block in enumerate(self.blocks):
@@ -288,20 +314,16 @@ class TransformerLanguageModel(nn.Module):
         # prefill()
         prompt = index[:, -BLOCK_SIZE:]
         logits, _, kv_cache = self(prompt, kv_cache=kv_cache, use_cache=use_cache, mask_use=True)
-        if use_cache:
-            tokens_to_generate = min(max_tokens_generate, BLOCK_SIZE - kv_cache[0].shape[3] + 1)
-        else:
-            tokens_to_generate = max_tokens_generate
         # first, get the actual raw values or `logits`
-        for step in range(tokens_to_generate):
+        past_length = kv_cache.shape[3]
+        for step in range(max_tokens_generate):
             next_token_logits = logits[:, -1, :] # this will take just the last timestep for all batches with all vocab size --> (B, C)
             # convert into probabilities from embeddings; we don't want raw logits, we want the converted probabilities or likelihood of what is the next character
             # probs = F.softmax(next_token_logits, dim=-1) # still (B, C)
             # next_idx = torch.multinomial(probs, 1) # then this becomes just (B, 1)
-            next_idx = torch.argmax(
-                next_token_logits,
-                dim=-1,
-                keepdim=True,
+            next_token_logits = F.softmax(next_token_logits)
+            next_idx = torch.multinomial(
+                next_token_logits
             )
 
             index = torch.cat((index, next_idx), dim=1)
@@ -312,7 +334,7 @@ class TransformerLanguageModel(nn.Module):
                 torch.mps.synchronize()
             times.append(time.perf_counter())
 
-            if step + 1 < tokens_to_generate:
+            if step + 1 < max_tokens_generate:
                 if use_cache:
                     logits, _, kv_cache = self(
                         next_idx,

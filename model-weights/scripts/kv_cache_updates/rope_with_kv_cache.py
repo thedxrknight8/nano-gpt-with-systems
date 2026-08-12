@@ -3,12 +3,10 @@ from statistics import median
 
 import torch
 import torch.nn as nn
-from torch import Tensor
 from torch.nn import functional as F
 
 import time
 
-# hyperparameters
 BLOCK_SIZE = 256
 BATCH_SIZE = 64
 EPOCHS = 2500
@@ -19,14 +17,15 @@ EVAL_ITERS = 200
 
 N_EMBD = 384
 N_HEADS = 6
-# ATTENTION_SIZE = 16
 HEAD_SIZE = N_EMBD // N_HEADS
-N_LAYERS = 4
+N_LAYERS = 6
 
 DROPOUT_RATE = 0.2
 
-MAX_TOKENS_GENERATE = 250
+MAX_TOKENS_GENERATE = 500
 BENCHMARK_TRIALS = 10
+
+MAX_SEQ_LENGTH = BLOCK_SIZE + MAX_TOKENS_GENERATE
 
 # ---------------
 
@@ -70,15 +69,11 @@ def evaluate_loss(model):
         losses = torch.zeros(EVAL_ITERS).to(device=DEVICE)
         for k in range(EVAL_ITERS):
             xb, yb = get_batch(split)
-            _, loss, _ = model(xb, yb)
+            _, loss, _, _ = model(xb, yb)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
-
-# create a `Head` module that performs one operation of self-attention
-# NOTE: LM-Head is the head that turns embedding size vector into actual vocab size vector, a SA-head is the head the performs
-# self-attention
 
 class RoPEModule(nn.Module):
     def __init__(self, d_head, max_seq_length=MAX_TOKENS_GENERATE, base=10000):
@@ -87,19 +82,19 @@ class RoPEModule(nn.Module):
         theta = 1.0 / (base ** (torch.arange(0, d_head, 2).float() / d_head)) # (d_head // 2,)
 
         seq_length = torch.arange(max_seq_length).float() # (max_seq_length,)
-        theta_values = torch.outer(seq_length, theta) # (max_seq_length,d_head//2) -> gives you the rotation values  
+        theta_values = torch.outer(seq_length, theta) # (max_seq_length, d_head//2) -> gives you the rotation values  
 
         self.register_buffer("sin", torch.sin(theta_values))
         self.register_buffer("cos", torch.cos(theta_values))
 
-    def forward(self, x):
+    def forward(self, x, start_pos):
         T = x.shape[1]
 
         x_evens = x[..., 0::2]
         x_odds = x[..., 1::2]
 
-        cos = self.cos[:T, :].unsqueeze(0)
-        sin = self.sin[:T, :].unsqueeze(0)
+        cos = self.cos[start_pos: start_pos + T, :].unsqueeze(0)
+        sin = self.sin[start_pos: start_pos + T, :].unsqueeze(0)
 
         x_first = x_evens * cos - x_odds * sin
         x_second = x_evens * sin + x_odds * cos
@@ -110,19 +105,27 @@ class RoPEModule(nn.Module):
 
         return out 
 
+    
+# create a `Head` module that performs one operation of self-attention
+# NOTE: LM-Head is the head that turns embedding size vector into actual vocab size vector, a SA-head is the head the performs
+# self-attention
+
 class AttentionHead(nn.Module):
     def __init__(self, head_size):
         super().__init__()
 
         self.head_size = head_size
-        self.key = nn.Linear(N_EMBD, self.head_size, bias=False)
-        self.query = nn.Linear(N_EMBD, self.head_size, bias=False)
-        self.value = nn.Linear(N_EMBD, self.head_size)
-        self.rope = RoPEModule(N_EMBD, MAX_TOKENS_GENERATE)
+
+        # self.key = nn.Linear(N_EMBD, self.head_size, bias=False)
+        # self.query = nn.Linear(N_EMBD, self.head_size, bias=False)
+        # self.value = nn.Linear(N_EMBD, self.head_size)
+        # vectorized projections for qkv
+        self.qkv = nn.Linear(N_EMBD, 3 * N_EMBD, bias=False)
+        self.rope = RoPEModule(self.head_size, MAX_SEQ_LENGTH)
         self.dropout = nn.Dropout(DROPOUT_RATE)
-        self.register_buffer("tril", torch.tril(torch.ones(BLOCK_SIZE,BLOCK_SIZE,dtype=torch.int)).to(device=DEVICE))
+        self.register_buffer("tril", torch.tril(torch.ones(MAX_SEQ_LENGTH, MAX_SEQ_LENGTH, dtype=torch.int)).to(device=DEVICE))
     
-    def forward(self, x, kv_cache, use_cache, mask_use=True):
+    def forward(self, x, kv_cache, use_cache, cache_position=0):
         
         _,T,_ = x.shape
         
@@ -130,40 +133,37 @@ class AttentionHead(nn.Module):
         q = self.query(x)
         v = self.value(x)
 
-        k = self.rope(k)
-        q = self.rope(q)
-        
-        k_attention = k
-        v_attention = v
+        k = self.rope(k, cache_position)
+        q = self.rope(q, cache_position)
+
+        key_length = 0
+
         if use_cache: 
-            if kv_cache is None or kv_cache[0].shape[-2] == 0:
-                kv_cache = [None] * 2
-                kv_cache[0] = k
-                kv_cache[1] = v
-            elif T >= BLOCK_SIZE:
-                kv_cache[0] = k[:, T-BLOCK_SIZE:, :]
-                kv_cache[1] = v[:, T-BLOCK_SIZE:, :]
-            elif T + kv_cache[0].shape[-2] > BLOCK_SIZE:
-                kv_cache[0] = torch.concat([kv_cache[0], k], dim=-2)[:, -BLOCK_SIZE:, :]
-                kv_cache[1] = torch.concat([kv_cache[1], v], dim=-2)[:, -BLOCK_SIZE:, :]
-            else:
-                kv_cache[0] = torch.concat([kv_cache[0][:, :, :], k], dim=-2)
-                kv_cache[1] = torch.concat([kv_cache[1][:, :, :], v], dim=-2)
-            
-            k_attention = kv_cache[0]
-            v_attention = kv_cache[1] 
-        
+            kv_cache[0][:, cache_position: cache_position + T, :] = k
+            kv_cache[1][:, cache_position: cache_position + T, :] = v
+
+            key_length = cache_position + T
+            k_attention = kv_cache[0][:, :key_length, :]
+            v_attention = kv_cache[1][:, :key_length, :]
+        else:
+            key_length = T
+            k_attention = k
+            v_attention = v
         
         wei = q @ torch.transpose(k_attention, -2, -1) * self.head_size ** -0.5
 
-        if mask_use:
-            wei = torch.masked_fill(wei, (self.tril[:T, :T] == 0), float('-inf'))
+        key_length = cache_position + T
+        mask = self.tril[
+            cache_position : cache_position + T,
+            :key_length,
+        ]
+        wei = wei.masked_fill(mask==0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
         
         out = wei @ v_attention
         
-        return out, kv_cache # (B, T, 4)
+        return out # (B, T, 4)
         
 class FFN(nn.Module):
     def __init__(self, n_embd):
@@ -193,30 +193,22 @@ class MultiHead(nn.Module):
         # for instance, if you want to downsample because you just expanded to large dimension, and then bringing it back down to lower dimension for processing purposes
         # or, in this case, using it to mix together embeddings with same-dimension mapping
     
-    def forward(self, x, kv_cache, use_cache, mask_use=True):
+    def forward(self, x, kv_cache, use_cache, cache_position):
         # currently kv_cache follows a shape of (B, N_HEAD, T, N_EMBD)
         # each head call returns an output of size (B, T, N_EMBD//N_HEAD) and a kv_cache of size (B, T, N_EMBD)
         # we need one big output which is the combination of all outputs from each head call, concatenated such that
         # resulting shape is (B, T, N_EMBD) and kv_cache[:, i, :, :] = result_kv_cache for each i in N_HEAD
 
         total_output = []
-        updated_kv_caches = []
 
         for i, head in enumerate(self.heads):
-            output, updated_kv_cache = head(x, [kv_cache[0][:, i, :, :] if use_cache else None, kv_cache[1][:, i, :, :]] if use_cache else None, use_cache, mask_use)
+            output = head(x, [kv_cache[0][:, i, :, :] if use_cache else None, kv_cache[1][:, i, :, :]] if use_cache else None, use_cache, cache_position)
             total_output.append(output)
-            if use_cache:
-                updated_kv_caches.append(updated_kv_cache) # will be a collection of [[(B1, T1, HEAD), (B1, T1, HEAD)], [(B2, T2,
 
         x = torch.cat(total_output, dim=-1)
         x = self.dropout(self.proj(x))
 
-        if use_cache:
-            kv_cache = [
-                torch.stack([updated_cache[0] for updated_cache in updated_kv_caches], dim=1),
-                torch.stack([updated_cache[1] for updated_cache in updated_kv_caches], dim=1)
-            ]
-        return x, kv_cache # (B, N_HEAD, T, C)
+        return x # (B, N_HEAD, T, C)
 
 # create a `Block` class that performs communication then computation (attention --> FFN)
 class Block(nn.Module):
@@ -232,12 +224,12 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(self.embd_size) # for self.attention
         self.ln2 = nn.LayerNorm(self.embd_size) # for ffn
     
-    def forward(self, x, kv_cache, use_cache, mask_use=True):
+    def forward(self, x, kv_cache, use_cache, cache_position):
         B,T,_ = x.shape
-        out, kv_cache = self.attention(self.ln1(x), kv_cache, use_cache, mask_use)
+        out = self.attention(self.ln1(x), kv_cache, use_cache, cache_position)
         x = out + x # we add `x` back to mark a residual connection; essentially, we are mixing the old information with the new
         x = self.ffn(self.ln2(x)) + x # same here 
-        return x, kv_cache # (B, N_HEAD, T, C)
+        return x # (B, N_HEAD, T, C)
 
 class TransformerLanguageModel(nn.Module):
     def __init__(self):
@@ -252,31 +244,20 @@ class TransformerLanguageModel(nn.Module):
         self.ttft = 0.0
         self.tbt = 0.0
     
-    def forward(self, index, targets=None, kv_cache=None, use_cache=False, mask_use=True):
+    def forward(self, index, targets=None, kv_cache=None, use_cache=False, cache_position=0):
         B, T = index.shape
-        past_length = 0
 
         tok_emb = self.table_embedding(index) # (B, T, C), C = N_EMBD
         if use_cache and kv_cache is None:
             kv_cache = [None] * 2
-            kv_cache[0] = torch.empty(size=(B, N_LAYERS, N_HEADS, 0, HEAD_SIZE), device=DEVICE)
-            kv_cache[1] = torch.empty(size=(B, N_LAYERS, N_HEADS, 0, HEAD_SIZE), device=DEVICE)
-        if use_cache and kv_cache is not None:
-            past_length = kv_cache[0].shape[3]
+            kv_cache[0] = torch.empty(size=(B, N_LAYERS, N_HEADS, MAX_SEQ_LENGTH, HEAD_SIZE), device=DEVICE)
+            kv_cache[1] = torch.empty(size=(B, N_LAYERS, N_HEADS, MAX_SEQ_LENGTH, HEAD_SIZE), device=DEVICE)
 
         emb = tok_emb # (B, T, C)
 
-        updated_kv_cache = []
         for i, block in enumerate(self.blocks):
-            emb, updated_caches = block(emb, [kv_cache[0][:, i, :, :, :] if use_cache else None, kv_cache[1][:, i, :, :, :]] if use_cache else None, use_cache, mask_use)
-            if use_cache:
-                updated_kv_cache.append(updated_caches)
+            emb = block(emb, [kv_cache[0][:, i, :, :, :] if use_cache else None, kv_cache[1][:, i, :, :, :]] if use_cache else None, use_cache, cache_position)
 
-        if use_cache:
-            kv_cache = [
-                torch.stack([updated_cache[0] for updated_cache in updated_kv_cache], dim=1),
-                torch.stack([updated_cache[1] for updated_cache in updated_kv_cache], dim=1)
-            ]
         logits = self.lm_head(self.ln(emb)) # (B, T, VOCAB_SIZE) --> this is the new vector. `lm_head` is a layer that produces a 65-sized vector that shows
         # probabilities for what will be the next token. then, we just take the representation
         
@@ -287,7 +268,7 @@ class TransformerLanguageModel(nn.Module):
             logits = logits.view(B*T, C)
             targets = targets.view(B*T)
             loss = F.cross_entropy(logits, targets)
-        return logits, loss, kv_cache
+        return logits, loss, kv_cache, cache_position + T
 
 
     @torch.inference_mode()
@@ -312,18 +293,13 @@ class TransformerLanguageModel(nn.Module):
 
         if use_cache:
             kv_cache = [None] * 2
-            kv_cache[0] = torch.empty(size=(B, N_LAYERS, N_HEADS, 0, HEAD_SIZE), device=DEVICE)
-            kv_cache[1] = torch.empty(size=(B, N_LAYERS, N_HEADS, 0, HEAD_SIZE), device=DEVICE)
+            kv_cache[0] = torch.empty(size=(B, N_LAYERS, N_HEADS, MAX_SEQ_LENGTH, HEAD_SIZE), device=DEVICE)
+            kv_cache[1] = torch.empty(size=(B, N_LAYERS, N_HEADS, MAX_SEQ_LENGTH, HEAD_SIZE), device=DEVICE)
 
         # prefill()
-        prompt = index[:, -BLOCK_SIZE:]
-        logits, _, kv_cache = self(prompt, kv_cache=kv_cache, use_cache=use_cache, mask_use=True)
-        if use_cache:
-            tokens_to_generate = min(max_tokens_generate, BLOCK_SIZE - kv_cache[0].shape[3] + 1)
-        else:
-            tokens_to_generate = max_tokens_generate
+        logits, _, kv_cache, cache_position = self(index, kv_cache=kv_cache, use_cache=use_cache, cache_position=0)
         # first, get the actual raw values or `logits`
-        for step in range(tokens_to_generate):
+        for step in range(max_tokens_generate):
             next_token_logits = logits[:, -1, :] # this will take just the last timestep for all batches with all vocab size --> (B, C)
             # convert into probabilities from embeddings; we don't want raw logits, we want the converted probabilities or likelihood of what is the next character
             # probs = F.softmax(next_token_logits, dim=-1) # still (B, C)
@@ -342,20 +318,18 @@ class TransformerLanguageModel(nn.Module):
                 torch.mps.synchronize()
             times.append(time.perf_counter())
 
-            if step + 1 < tokens_to_generate:
+            if step + 1 < max_tokens_generate:
                 if use_cache:
-                    logits, _, kv_cache = self(
+                    logits, _, kv_cache, cache_position = self(
                         next_idx,
                         kv_cache=kv_cache,
                         use_cache=True,
-                        mask_use=False,
+                        cache_position=cache_position
                     )
                 else:
-                    idx_cond = index[:, -BLOCK_SIZE:]
-                    logits, _, _ = self(
-                        idx_cond,
+                    logits, _, _, _ = self(
+                        index,
                         use_cache=False,
-                        mask_use=True,
                     )
 
         if times:
@@ -376,7 +350,7 @@ class TransformerLanguageModel(nn.Module):
                 print(f'Epoch {i}: train loss (%.4f) {out["train"]:.4f}, val loss (%.4f) {out["val"]:.4f}')
             xb, yb = get_batch("train")
 
-            _, loss, _ = self(xb, yb)
+            _, loss, _, _ = self(xb, yb)
             
             optimizer.zero_grad()
             
@@ -416,7 +390,7 @@ for trial in range(BENCHMARK_TRIALS):
         benchmark_results[mode]["tbt"].append(m.tbt)
         benchmark_results[mode]["ttft"].append(m.ttft)
 
-with open("/outputs/v5_cache_comparison.txt", "w") as f:
+with open("/outputs/rope_cache_comparison.txt", "w") as f:
     outputs_equal = torch.equal(
         generated_outputs["cached"],
         generated_outputs["uncached"],

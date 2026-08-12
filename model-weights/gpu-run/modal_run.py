@@ -14,7 +14,7 @@ image = (
 def train():
     import subprocess
     subprocess.run(
-        ["python", "-u", "scripts/rope_updates/v6.py"],
+        ["python", "-u", "scripts/kv_cache_updates/rope_with_kv_cache.py"],
         cwd="/root/nano-gpt",
         check=True,
     )
