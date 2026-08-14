@@ -1,0 +1,8 @@
+average_tbt=0.010526235301204471 max_tokens_generated=250
+ttft=0.08442184300008648 max_tokens_generated=250
+-----------------------
+
+average_tbt=0.009859979465863396 max_tokens_generated=250
+ttft=0.08434859100009362 max_tokens_generated=250
+
+-----------------------
